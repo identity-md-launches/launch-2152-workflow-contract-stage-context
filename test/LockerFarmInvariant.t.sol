@@ -171,6 +171,16 @@ contract LockerFarmInvariantTest is Test {
         assertEq(locker.balanceOf(address(treasury)), handler.ghostReturned() + farm.totalFeesToTreasury());
     }
 
+    /// @dev Fee-eligible and pending stake always add up to the principal, so no stake is counted
+    ///      twice or lost by the eligibility delay.
+    function invariant_eligiblePlusPendingIsStaked() public view {
+        uint256 pending;
+        for (uint256 i; i < handler.actorCount(); ++i) {
+            pending += farm.pendingStakeOf(handler.actors(i));
+        }
+        assertEq(farm.eligibleTotalStaked() + pending, farm.totalStaked(), "eligibility accounting drift");
+    }
+
     /// @dev Emissions never exceed what was funded.
     function invariant_committedNeverExceedsFunding() public view {
         assertLe(

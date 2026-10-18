@@ -38,10 +38,21 @@ funding and schedules are isolated by construction.
 ### Economic rules (as specified, unchanged)
 
 * **Deposit fee: 0%.**
-* **Withdrawal fee: 10% of the withdrawn principal.** 9% is redistributed proportionally among the
-  *other* depositors of the same farm; the withdrawing address is excluded even on a partial
-  withdrawal (its checkpoint is moved past its own fee). 1% goes to the Treasury in the underlying
-  token. If there are no other depositors, the whole 10% goes to the Treasury.
+* **Withdrawal fee: 10% of the withdrawn principal** (rounded up to the wei, so even a 1-wei
+  withdrawal pays). 9% is redistributed proportionally among the *other eligible* depositors of the
+  same farm; the withdrawing address is excluded even on a partial withdrawal (its checkpoint is
+  moved past its own fee). 1% goes to the Treasury in the underlying token. If there are no other
+  eligible depositors, the whole 10% goes to the Treasury.
+* **Fee eligibility has a delay** (`FEE_ELIGIBILITY_PERIOD` = 1 day). Stake deposited during one
+  period becomes eligible for fee rewards at the start of the period after next, i.e. between 24 and
+  48 hours after the deposit (`feeEligibilityStart()` returns the exact timestamp for a deposit made
+  now). Until then the stake is *pending*: it earns LOCKER emissions normally and can be withdrawn
+  (paying the fee), but it neither receives fee rewards nor counts as an "other depositor". This is
+  what makes "no other eligible depositors" meaningful: a dust or same-block wallet, a front-run
+  deposit or a just-in-time deposit cannot take the Treasury's 10% or dilute the long-term
+  depositors' 9%. Withdrawals come out of pending stake first, so a top-up never costs eligible
+  stake. `pendingStakeOf`, `eligibleStakeOf` and `eligibleTotalStaked` expose the split for the
+  frontend.
 * **Fee rewards** are claimable at once (`claimFees`) in the underlying token with no further fee, and
   remain claimable after a full withdrawal.
 * **LOCKER rewards** accrue by stake and time. Each farm has its own reward reserve and 30-day epoch.
@@ -63,8 +74,14 @@ funding and schedules are isolated by construction.
 |------|-------|--------|----------|
 | Treasury owner | `LockerTreasury.owner()` | Withdraw Treasury balances, refill farms | **Not possible** (`renounceOwnership` reverts). Transfer is two-step. |
 | Farm creation | `LockerFarmFactory.owner()` | `createFarm`, `registerFarm` | `renounceOwnership()` — permanent. After it, no caller (including `address(0)`) passes `onlyOwner`. |
-| Emissions manager | `LockerFarm.emissionsManager` (per farm) | `startEpoch`, `boostEmissions`, `setRewardRate`, `returnUncommittedRewards`, transfer role | `renounceEmissionsManager()` — permanent; the role can only be set by its current holder, and nobody is `address(0)`. |
-| Guardian (emergency) | `LockerFarm.guardian` (per farm) | `pauseDeposits` / `unpauseDeposits`, transfer role | `renounceGuardian()` — permanent; deposits are unpaused on renounce so nothing is stuck. |
+| Emissions manager | `LockerFarm.emissionsManager` (per farm) | `startEpoch`, `boostEmissions`, `setRewardRate`, `returnUncommittedRewards`, offer role | `renounceEmissionsManager()` — permanent; refused while `rewardReserve > 0` (return or commit it first). Afterwards `fundRewards` is refused and `returnUncommittedRewards` becomes permissionless, so reserve that reappears (emissions recycled over a no-staker span) always has a path to the Treasury. |
+| Guardian (emergency) | `LockerFarm.guardian` (per farm) | `pauseDeposits` / `unpauseDeposits`, offer role | `renounceGuardian()` — permanent; deposits are unpaused on renounce so nothing is stuck. |
+
+Farm role transfers are **two-step**, like the Treasury's and factory's `Ownable2Step`: the holder
+calls `setEmissionsManager(new)` / `setGuardian(new)`, which only records an offer, and the new
+holder must call `acceptEmissionsManager()` / `acceptGuardian()`. A mistyped address therefore
+cannot lose the role; the holder can replace or cancel the offer (`set…(address(0))`) until it is
+accepted, and renouncing clears any pending offer.
 
 Withdrawals and claims can never be paused. There are no proxies, no `DELEGATECALL`, no
 `SELFDESTRUCT`, no hidden admin and no upgrade path, so a renounced role cannot be restored. At launch
@@ -126,7 +143,12 @@ an owner-only call that emits an event.
 4. **Fund the Treasury**: transfer 50% of the LOCKER supply (500,000,000 LOCKER) from the requester
    wallet to the `LockerTreasury` address with a normal ERC-20 transfer, as planned in the brief.
 5. **Refill each farm**: `LockerTreasury.fundFarm(<farm>, <amount>)` (or anyone may call
-   `LockerFarm.fundRewards` after approving). This only raises the farm's reserve.
+   `LockerFarm.fundRewards` after approving). This only raises the farm's reserve. Both revert on a
+   farm whose emissions manager has been renounced. Never send LOCKER to a farm with a plain
+   transfer: it is not credited to the reserve. If it happens anyway, anyone can call
+   `syncRewardReserve()` to credit the untracked balance (`untrackedBalance(token)`) to the
+   reserve; on the IMD and sIMD farms a stray transfer of the *staking* token is sent to the Treasury
+   by `recoverExcessStakingToken()`.
 6. **Start each farm's first epoch**: `LockerFarm.startEpoch(<amount>)` as emissions manager.
    `amount` must be at least 2,592,000 wei of LOCKER (one wei per second) and at most the reserve.
 7. **Frontend configuration**: point the site at the token, Treasury, factory and farm addresses from
@@ -134,7 +156,10 @@ an owner-only call that emits an event.
 
 Later: `boostEmissions`, `setRewardRate`, further `startEpoch` calls and further `createFarm` calls
 as needed; `pauseDeposits` for emergencies; the `renounce*` functions when the project decides to
-decentralise, one role at a time, keeping the Treasury owner.
+decentralise, one role at a time, keeping the Treasury owner. Before `renounceEmissionsManager`,
+return the farm's uncommitted reserve to the Treasury with `returnUncommittedRewards(rewardReserve())`
+(or commit it with `startEpoch`); the renounce reverts otherwise. Role hand-overs to a multisig need
+the multisig to call `accept…` before the old key is retired.
 
 ## Chosen constants
 
@@ -143,6 +168,7 @@ decentralise, one role at a time, keeping the Treasury owner.
 | `EPOCH_DURATION` | 30 days | `LockerFarm` | Given by the brief. |
 | `WITHDRAWAL_FEE_BPS` / `REDISTRIBUTED_FEE_BPS` / `TREASURY_FEE_BPS` | 1000 / 900 / 100 | `LockerFarm` | 10% / 9% / 1%, given by the brief. |
 | `PRECISION` | 1e18 | `LockerFarm` | Accumulator scale; all per-user math uses 512-bit `mulDiv`, so it cannot overflow. |
+| `FEE_ELIGIBILITY_PERIOD` | 1 day | `LockerFarm` | Chosen here (the brief leaves it open). Stake shares in withdrawal fees from the start of the period after the one it was deposited in (24–48 h). Long enough that a dust or just-in-time stake cannot capture a fee in the same block or day; short enough not to matter to a 30-day farmer. |
 | `TOTAL_SUPPLY` | 1e27 | `LaunchToken` | Launch policy. |
 
 ## Assumptions and deviations from the brief
@@ -162,6 +188,18 @@ decentralise, one role at a time, keeping the Treasury owner.
   events. When data is missing the site should show "APR unavailable".
 * **Who is "Team".** The 80/20 Treasury/Team split of LP fees is a manual off-chain action by the
   owner; no Team address is stored on chain.
+* **Fee-eligibility delay.** The brief's rules "9% to the other depositors", "exclude the
+  withdrawing address" and "all 10% to the Treasury if no other eligible depositors exist" were
+  implemented literally in the first version, and the independent review showed that made them
+  hollow: a 1-wei stake from a second wallet, or a deposit in the withdrawal's block, counted as an
+  "other depositor" and took the 9% (and, for a sole depositor, 90% of the Treasury's share). The
+  delay above is the chosen reading of *eligible*. It is the one economic parameter added to the
+  brief's rules; the percentages and recipients are unchanged. A patient sybil that stakes a second
+  wallet more than two days ahead is still indistinguishable from a genuine depositor on chain, and
+  no contract rule can tell them apart; the delay removes the free, atomic versions of the trick and
+  makes the pre-positioned one pay the fee on its own exit.
+* **Fee rounding** favours the protocol: the 10% rounds up to the wei, the 9% share rounds down and
+  the Treasury receives the difference, so no withdrawal, however small, escapes the fee.
 
 ## Operational responsibilities and trust assumptions
 
@@ -174,9 +212,15 @@ decentralise, one role at a time, keeping the Treasury owner.
 * Staked tokens must be plain ERC-20s. Deposits credit the amount actually received (fee-on-transfer
   tokens are credited correctly, but their withdrawals deliver less than `payout`). **Rebasing tokens
   are not supported**: balances changing without transfers would break the principal accounting.
-* Rounding: fees and rewards floor. A withdrawal under 10 wei pays no fee; per-share rounding leaves
-  a few wei of dust in the farm (never a shortfall, see the invariant tests). Rewards emitted while
-  nobody is staked return to the reserve; reward-per-token rounding dust stays in the farm.
+* Rounding: the withdrawal fee rounds up, rewards and per-share accumulators round down. Per-share
+  rounding leaves a few wei of dust in the farm (never a shortfall, see the invariant tests), which
+  `syncRewardReserve` can fold back into the reserve. Rewards emitted while nobody is staked return
+  to the reserve.
+* Renouncing the emissions manager is final. The contract refuses it while uncommitted reserve
+  remains, refuses new funding afterwards, and lets anyone return later-recycled reserve to the
+  Treasury, so no LOCKER can be stranded by the renounce. Tokens sent to a farm by plain transfer are
+  recoverable through `syncRewardReserve` / `recoverExcessStakingToken` (to the reserve or the
+  Treasury, never to a caller).
 * **Not audited.** Tests passing is not an audit. The contracts hold user funds and need the
   independent adversarial review that follows this stage before release.
 
@@ -190,19 +234,27 @@ forge fmt --check
 FOUNDRY_FUZZ_SEED=0x854336ea9d255bb73b298897b5ed19b6b1f127e0d9e91079beedf983f2109bd1 forge test
 ```
 
-Results on the authoring machine (forge 1.8.3, solc 0.8.26): 87 tests, 0 failures, with and without
-the seed; `forge fmt --check` clean. The suite covers:
+Results on the authoring machine (forge 1.8.3, solc 0.8.26): 106 tests, 0 failures, with and
+without the seed; `forge fmt --check` clean. The suite covers:
 
 * `LaunchToken.t.sol` — name/symbol/decimals, whole supply to deployer, exact transfers, no mint or
   admin surface, fuzzed supply conservation.
 * `LockerFarmFees.t.sol` — zero deposit fee, the 10% split, proportional redistribution, exclusion of
   the withdrawer on partial withdrawals, sole-depositor case, immediate and post-exit fee claims,
   double claims, late depositors, `exit`, fuzzed conservation and solvency.
+* `LockerFarmFeeEligibility.t.sol` — the eligibility delay: the reviewer's dust-wallet and
+  same-block scenarios (Treasury receives the full 10%), the just-in-time depositor (earns nothing,
+  pays to leave), pending stake earning emissions and being withdrawable, maturity at the exact
+  bucket boundary, single crediting of matured tranches, consecutive-day tranches, pending-first
+  withdrawals, previews, fee rounding (fuzzed) and fuzzed solvency / `eligible + pending == staked`.
 * `LockerFarmRewards.t.sol` — funding without emission change, epoch start/roll-over, boosts, rate
   changes up/down/zero, insolvency reverts, principal and accrued rewards never re-committed
   (including on the LOCKER farm), no-staker recycling, fuzzed "never over-promises".
-* `LockerFarmRoles.t.sol` — role separation, transfers, permanent renouncement (old holder, stranger
-  and `address(0)` all rejected), pause semantics, Treasury powerlessness, token recovery.
+* `LockerFarmRoles.t.sol` — role separation, two-step transfers (offer, wrong acceptor, cancel,
+  replace), permanent renouncement (old holder, former offeree, stranger and `address(0)` all
+  rejected), renounce refused with reserve left, funding refused and permissionless return to the
+  Treasury after renounce, pause semantics, Treasury powerlessness, token recovery and the
+  untracked-balance sync.
 * `LockerFarmReentrancy.t.sol` — a callback token attempting re-entrant `withdraw`, `claimFees`,
   `exit` and `deposit` is blocked by the guard.
 * `LockerTreasury.t.sol` — refills, withdrawals, ETH handling, non-renounceable two-step ownership,
@@ -211,7 +263,8 @@ the seed; `forge fmt --check` clean. The suite covers:
   renouncement of farm creation.
 * `DeployLocker.t.sol` — the script wires the launch owner everywhere and never the deployer.
 * `LockerFarmInvariant.t.sol` — stateful fuzzing of a LOCKER-staking farm (the same-token case):
-  solvency against all obligations, token-flow conservation and "emissions never exceed funding".
+  solvency against all obligations, token-flow conservation, `eligible + pending == staked` and
+  "emissions never exceed funding".
 
 Slither/Mythril were not available in this environment and did not run.
 

@@ -43,6 +43,7 @@ contract LockerFarmFeesTest is FarmTestBase {
     function test_partialWithdrawalSplitsFeeAndExcludesWithdrawer() public {
         _deposit(imdFarm, ALICE, 1_000e18);
         _deposit(imdFarm, BOB, 3_000e18);
+        _matureStakes();
 
         uint256 aliceBefore = imd.balanceOf(ALICE);
         vm.expectEmit(true, false, false, true);
@@ -63,6 +64,7 @@ contract LockerFarmFeesTest is FarmTestBase {
         _deposit(imdFarm, ALICE, 1_000e18);
         _deposit(imdFarm, BOB, 1_000e18);
         _deposit(imdFarm, CAROL, 3_000e18);
+        _matureStakes();
 
         _withdraw(imdFarm, ALICE, 1_000e18);
         // 90 redistributed over Bob (1/4) and Carol (3/4).
@@ -101,6 +103,7 @@ contract LockerFarmFeesTest is FarmTestBase {
     function test_previewWithdrawMatchesExecution() public {
         _deposit(imdFarm, ALICE, 777e18);
         _deposit(imdFarm, BOB, 1_234e18);
+        _matureStakes();
         (uint256 payout, uint256 redistributed, uint256 toTreasury) = imdFarm.previewWithdraw(ALICE, 333e18);
         uint256 before = imd.balanceOf(ALICE);
         uint256 treasuryBefore = imd.balanceOf(address(treasury));
@@ -117,6 +120,7 @@ contract LockerFarmFeesTest is FarmTestBase {
     function test_feesClaimableImmediatelyWithoutExtraFee() public {
         _deposit(imdFarm, ALICE, 1_000e18);
         _deposit(imdFarm, BOB, 1_000e18);
+        _matureStakes();
         _withdraw(imdFarm, ALICE, 1_000e18);
         assertEq(imdFarm.pendingFees(BOB), 90e18);
 
@@ -131,6 +135,7 @@ contract LockerFarmFeesTest is FarmTestBase {
     function test_feesRemainClaimableAfterFullWithdrawal() public {
         _deposit(imdFarm, ALICE, 1_000e18);
         _deposit(imdFarm, BOB, 3_000e18);
+        _matureStakes();
         _withdraw(imdFarm, ALICE, 400e18); // Bob earns 36
         _withdraw(imdFarm, BOB, 3_000e18); // Bob leaves; Alice earns 270
         assertEq(imdFarm.balanceOf(BOB), 0);
@@ -146,6 +151,7 @@ contract LockerFarmFeesTest is FarmTestBase {
     function test_doubleClaimFeesPaysNothingTwice() public {
         _deposit(imdFarm, ALICE, 1_000e18);
         _deposit(imdFarm, BOB, 1_000e18);
+        _matureStakes();
         _withdraw(imdFarm, ALICE, 1_000e18);
         vm.startPrank(BOB);
         imdFarm.claimFees();
@@ -158,6 +164,7 @@ contract LockerFarmFeesTest is FarmTestBase {
     function test_withdrawerKeepsFeesEarnedBeforeOwnWithdrawal() public {
         _deposit(imdFarm, ALICE, 1_000e18);
         _deposit(imdFarm, BOB, 1_000e18);
+        _matureStakes();
         _withdraw(imdFarm, BOB, 500e18); // Alice earns 45
         assertEq(imdFarm.pendingFees(ALICE), 45e18);
         _withdraw(imdFarm, ALICE, 500e18); // Alice's own fee goes to Bob only
@@ -168,6 +175,7 @@ contract LockerFarmFeesTest is FarmTestBase {
     function test_lateDepositorDoesNotEarnEarlierFees() public {
         _deposit(imdFarm, ALICE, 1_000e18);
         _deposit(imdFarm, BOB, 1_000e18);
+        _matureStakes();
         _withdraw(imdFarm, ALICE, 1_000e18);
         _deposit(imdFarm, CAROL, 5_000e18);
         assertEq(imdFarm.pendingFees(CAROL), 0);
@@ -177,6 +185,7 @@ contract LockerFarmFeesTest is FarmTestBase {
     function test_exitWithdrawsAllAndClaimsFees() public {
         _deposit(imdFarm, ALICE, 1_000e18);
         _deposit(imdFarm, BOB, 1_000e18);
+        _matureStakes();
         _withdraw(imdFarm, ALICE, 500e18); // Bob earns 45
         uint256 before = imd.balanceOf(BOB);
         vm.prank(BOB);
@@ -196,6 +205,7 @@ contract LockerFarmFeesTest is FarmTestBase {
         w = bound(w, 1, a);
         _deposit(imdFarm, ALICE, a);
         _deposit(imdFarm, BOB, b);
+        _matureStakes();
 
         uint256 aliceBefore = imd.balanceOf(ALICE);
         _withdraw(imdFarm, ALICE, w);
@@ -203,9 +213,9 @@ contract LockerFarmFeesTest is FarmTestBase {
         uint256 toTreasury = imd.balanceOf(address(treasury));
         uint256 bobFees = imdFarm.pendingFees(BOB);
 
-        uint256 fee = w / 10;
+        uint256 fee = (w + 9) / 10; // rounds up
         uint256 share = w * 900 / 10_000;
-        assertEq(payout, w - fee, "payout is 90% floored");
+        assertEq(payout, w - fee, "payout is 90%, fee rounded up");
         assertEq(toTreasury, fee - share, "treasury gets exactly its 1%");
         assertLe(bobFees, share, "bob never gets more than the 9%");
         assertLe(share - bobFees, b / 1e18 + 1, "bob gets the 9% minus at most per-share rounding");
@@ -223,6 +233,7 @@ contract LockerFarmFeesTest is FarmTestBase {
             uint256 amt = bound(uint256(keccak256(abi.encode(seed, i))), 1e6, 500_000e18);
             _deposit(imdFarm, users[i], amt);
         }
+        _matureStakes();
         for (uint256 i; i < 3; ++i) {
             uint256 bal = imdFarm.balanceOf(users[i]);
             uint256 w = bound(uint256(keccak256(abi.encode(seed, i, "w"))), 1, bal);

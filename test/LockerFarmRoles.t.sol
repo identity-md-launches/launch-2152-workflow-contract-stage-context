@@ -53,52 +53,125 @@ contract LockerFarmRolesTest is FarmTestBase {
         vm.stopPrank();
     }
 
-    function test_emissionsManagerCanBeTransferred() public {
+    function test_emissionsManagerTransferIsTwoStep() public {
         vm.prank(OWNER);
         imdFarm.setEmissionsManager(MULTISIG);
-        assertEq(imdFarm.emissionsManager(), MULTISIG);
-        vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
+        // Nothing changes until the new holder accepts; the mistyped-address case stays recoverable.
+        assertEq(imdFarm.emissionsManager(), OWNER);
+        assertEq(imdFarm.pendingEmissionsManager(), MULTISIG);
         vm.prank(OWNER);
-        imdFarm.startEpoch(1e18);
-        vm.prank(MULTISIG);
         imdFarm.startEpoch(1e18);
         assertGt(imdFarm.rewardRate(), 0);
+
+        vm.expectRevert(LockerFarm.NotPendingEmissionsManager.selector);
+        vm.prank(MALLORY);
+        imdFarm.acceptEmissionsManager();
+
+        vm.expectEmit(true, true, false, true);
+        emit LockerFarm.EmissionsManagerTransferred(OWNER, MULTISIG);
+        vm.prank(MULTISIG);
+        imdFarm.acceptEmissionsManager();
+        assertEq(imdFarm.emissionsManager(), MULTISIG);
+        assertEq(imdFarm.pendingEmissionsManager(), address(0));
+        vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
+        vm.prank(OWNER);
+        imdFarm.boostEmissions(1e18);
+        vm.prank(MULTISIG);
+        imdFarm.boostEmissions(1e18);
     }
 
-    function test_setEmissionsManagerToZeroReverts() public {
-        vm.expectRevert(LockerFarm.ZeroAddress.selector);
+    function test_emissionsManagerOfferCanBeCancelledOrReplaced() public {
+        vm.startPrank(OWNER);
+        imdFarm.setEmissionsManager(MALLORY); // mistyped
+        imdFarm.setEmissionsManager(MULTISIG); // corrected
+        vm.stopPrank();
+        vm.expectRevert(LockerFarm.NotPendingEmissionsManager.selector);
+        vm.prank(MALLORY);
+        imdFarm.acceptEmissionsManager();
         vm.prank(OWNER);
-        imdFarm.setEmissionsManager(address(0));
+        imdFarm.setEmissionsManager(address(0)); // cancelled
+        assertEq(imdFarm.pendingEmissionsManager(), address(0));
+        vm.expectRevert(LockerFarm.NotPendingEmissionsManager.selector);
+        vm.prank(MULTISIG);
+        imdFarm.acceptEmissionsManager();
+        vm.expectRevert(LockerFarm.NotPendingEmissionsManager.selector);
+        vm.prank(address(0));
+        imdFarm.acceptEmissionsManager();
+        assertEq(imdFarm.emissionsManager(), OWNER);
+    }
+
+    function test_renounceEmissionsManagerRequiresEmptyReserve() public {
+        _startEpoch(imdFarm, 1_000e18);
+        uint256 reserve = imdFarm.rewardReserve();
+        assertGt(reserve, 0);
+        vm.expectRevert(abi.encodeWithSelector(LockerFarm.ReserveNotEmpty.selector, reserve));
+        vm.prank(OWNER);
+        imdFarm.renounceEmissionsManager();
+        assertEq(imdFarm.emissionsManager(), OWNER, "still in control");
     }
 
     function test_renouncedEmissionsManagerIsPermanent() public {
         _startEpoch(imdFarm, 1_000e18);
-        vm.prank(OWNER);
+        vm.startPrank(OWNER);
+        imdFarm.setEmissionsManager(MULTISIG); // a pending offer must die with the role
+        imdFarm.returnUncommittedRewards(imdFarm.rewardReserve());
         imdFarm.renounceEmissionsManager();
+        vm.stopPrank();
         assertEq(imdFarm.emissionsManager(), address(0));
+        assertEq(imdFarm.pendingEmissionsManager(), address(0));
 
-        // Neither the old manager, a stranger, nor the zero address can act or reinstate the role.
-        address[3] memory callers = [OWNER, MALLORY, address(0)];
-        for (uint256 i; i < 3; ++i) {
+        // Neither the old manager, the former offeree, a stranger, nor the zero address can act or
+        // reinstate the role.
+        address[4] memory callers = [OWNER, MULTISIG, MALLORY, address(0)];
+        for (uint256 i; i < 4; ++i) {
             vm.startPrank(callers[i]);
             vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
             imdFarm.setEmissionsManager(OWNER);
+            vm.expectRevert(LockerFarm.NotPendingEmissionsManager.selector);
+            imdFarm.acceptEmissionsManager();
             vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
             imdFarm.startEpoch(1e18);
             vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
-            imdFarm.returnUncommittedRewards(1);
+            imdFarm.boostEmissions(1e18);
+            vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
+            imdFarm.setRewardRate(1);
             vm.stopPrank();
         }
 
-        // The running schedule, funding, staking and claiming keep working.
+        // Funding a farm nobody can emit from is refused, so LOCKER cannot be lost into it.
+        vm.startPrank(OWNER);
+        locker.approve(address(imdFarm), 10e18);
+        vm.expectRevert(LockerFarm.EmissionsRenounced.selector);
+        imdFarm.fundRewards(10e18);
+        vm.stopPrank();
+
+        // The running schedule, staking and claiming keep working.
         _deposit(imdFarm, ALICE, 100e18);
-        _fund(imdFarm, 10e18);
         vm.warp(block.timestamp + 5 days);
         assertGt(imdFarm.earned(ALICE), 0);
         vm.prank(ALICE);
         imdFarm.exit();
         // Guardian role is unaffected.
         assertEq(imdFarm.guardian(), OWNER);
+    }
+
+    function test_reserveReappearingAfterRenounceGoesToTreasury() public {
+        _startEpoch(imdFarm, 1_000e18);
+        vm.startPrank(OWNER);
+        imdFarm.returnUncommittedRewards(imdFarm.rewardReserve());
+        imdFarm.renounceEmissionsManager();
+        vm.stopPrank();
+        // Nobody is staked, so a span of the epoch recycles into the reserve.
+        vm.warp(block.timestamp + 10 days);
+        _deposit(imdFarm, ALICE, 1e18);
+        uint256 recycled = imdFarm.rewardReserve();
+        assertGt(recycled, 0);
+        // With the role renounced anyone may send it to the immutable Treasury, nowhere else.
+        uint256 before = locker.balanceOf(address(treasury));
+        vm.prank(MALLORY);
+        imdFarm.returnUncommittedRewards(recycled);
+        assertEq(locker.balanceOf(address(treasury)) - before, recycled);
+        assertEq(imdFarm.rewardReserve(), 0);
     }
 
     // ------------------------------------------------------------------ guardian
@@ -160,15 +233,36 @@ contract LockerFarmRolesTest is FarmTestBase {
         assertEq(imdFarm.emissionsManager(), OWNER);
     }
 
-    function test_guardianCanBeTransferred() public {
+    function test_guardianTransferIsTwoStep() public {
         vm.prank(OWNER);
         imdFarm.setGuardian(MULTISIG);
+        assertEq(imdFarm.guardian(), OWNER);
+        assertEq(imdFarm.pendingGuardian(), MULTISIG);
+        vm.expectRevert(LockerFarm.NotPendingGuardian.selector);
+        vm.prank(MALLORY);
+        imdFarm.acceptGuardian();
+        vm.prank(MULTISIG);
+        imdFarm.acceptGuardian();
+        assertEq(imdFarm.guardian(), MULTISIG);
+        assertEq(imdFarm.pendingGuardian(), address(0));
         vm.expectRevert(LockerFarm.NotGuardian.selector);
         vm.prank(OWNER);
         imdFarm.pauseDeposits();
         vm.prank(MULTISIG);
         imdFarm.pauseDeposits();
         assertTrue(imdFarm.depositsPaused());
+    }
+
+    function test_renounceGuardianKillsPendingOffer() public {
+        vm.startPrank(OWNER);
+        imdFarm.setGuardian(MULTISIG);
+        imdFarm.renounceGuardian();
+        vm.stopPrank();
+        assertEq(imdFarm.pendingGuardian(), address(0));
+        vm.expectRevert(LockerFarm.NotPendingGuardian.selector);
+        vm.prank(MULTISIG);
+        imdFarm.acceptGuardian();
+        assertEq(imdFarm.guardian(), address(0));
     }
 
     // ------------------------------------------------------------------ no hidden powers
@@ -199,5 +293,58 @@ contract LockerFarmRolesTest is FarmTestBase {
         imdFarm.recoverERC20(address(locker));
         vm.expectRevert(LockerFarm.ZeroAmount.selector);
         imdFarm.recoverERC20(address(stray));
+    }
+
+    function test_plainLockerTransferCanBeSyncedIntoReserve() public {
+        _deposit(imdFarm, ALICE, 500e18);
+        _startEpoch(imdFarm, 1_000e18);
+        vm.warp(block.timestamp + 3 days);
+        // LOCKER sent with a plain transfer instead of fundRewards: not in the reserve.
+        vm.prank(OWNER);
+        locker.transfer(address(imdFarm), 7e18);
+        uint256 reserveBefore = imdFarm.rewardReserve();
+        assertEq(imdFarm.untrackedBalance(address(locker)), 7e18);
+        vm.expectRevert(
+            abi.encodeWithSelector(LockerFarm.InsufficientRewardReserve.selector, reserveBefore + 7e18, reserveBefore)
+        );
+        _startEpoch(imdFarm, reserveBefore + 7e18);
+
+        vm.prank(MALLORY); // permissionless, only moves the excess into the reserve
+        imdFarm.syncRewardReserve();
+        assertEq(imdFarm.rewardReserve(), reserveBefore + 7e18);
+        assertEq(imdFarm.untrackedBalance(address(locker)), 0);
+        vm.expectRevert(LockerFarm.ZeroAmount.selector);
+        imdFarm.syncRewardReserve();
+        // The synced amount is real: it can be committed and the farm stays solvent for it.
+        _startEpoch(imdFarm, reserveBefore + 7e18);
+        vm.warp(block.timestamp + 30 days);
+        vm.prank(ALICE);
+        imdFarm.exit();
+        assertGe(locker.balanceOf(address(imdFarm)), imdFarm.rewardReserve());
+    }
+
+    function test_syncNeverTouchesAccruedRewardsOrCommittedEmissions() public {
+        _deposit(imdFarm, ALICE, 500e18);
+        _startEpoch(imdFarm, 1_000e18);
+        vm.warp(block.timestamp + 10 days);
+        // Everything the farm holds is owed: reserve, accrued rewards and the rest of the epoch.
+        assertEq(imdFarm.untrackedBalance(address(locker)), 0);
+        vm.expectRevert(LockerFarm.ZeroAmount.selector);
+        imdFarm.syncRewardReserve();
+    }
+
+    function test_excessStakingTokenGoesToTreasury() public {
+        _deposit(imdFarm, ALICE, 500e18);
+        imd.mint(address(imdFarm), 3e18); // plain transfer of the staking token
+        assertEq(imdFarm.untrackedBalance(address(imd)), 3e18);
+        vm.prank(MALLORY);
+        imdFarm.recoverExcessStakingToken();
+        assertEq(imd.balanceOf(address(treasury)), 3e18);
+        assertEq(imd.balanceOf(address(imdFarm)), 500e18, "principal untouched");
+        vm.expectRevert(LockerFarm.ZeroAmount.selector);
+        imdFarm.recoverExcessStakingToken();
+        // On the LOCKER farm the staking token is the reward token: only the reserve sync applies.
+        vm.expectRevert(LockerFarm.ProtectedToken.selector);
+        lockerFarm.recoverExcessStakingToken();
     }
 }

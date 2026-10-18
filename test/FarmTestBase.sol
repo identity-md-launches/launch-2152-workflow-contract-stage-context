@@ -59,6 +59,11 @@ abstract contract FarmTestBase is Test {
         farm.deposit(amount);
     }
 
+    /// @dev Moves time past the fee-eligibility delay so every stake deposited so far shares fees.
+    function _matureStakes() internal {
+        vm.warp(block.timestamp + 2 * 1 days);
+    }
+
     function _withdraw(LockerFarm farm, address who, uint256 amount) internal {
         vm.prank(who);
         farm.withdraw(amount);

@@ -35,6 +35,8 @@ contract LockerFarmReentrancyTest is Test {
 
         hooked.mint(address(attacker), 1_000e18);
         attacker.depositToFarm(1_000e18);
+        // Past the fee-eligibility delay, so both stakes share fees.
+        vm.warp(block.timestamp + 2 days);
     }
 
     function test_reenteringWithdrawIsBlocked() public {
