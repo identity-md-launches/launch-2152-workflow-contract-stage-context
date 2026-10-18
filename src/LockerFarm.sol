@@ -40,8 +40,10 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///      transfers are two-step, the new holder must accept):
 ///      - `emissionsManager`: starts epochs, boosts or re-rates the running epoch and may return
 ///        *uncommitted* reward reserve to the Treasury. Cannot touch principal or accrued rewards.
-///        Renouncing requires an empty reserve; afterwards funding is refused and anyone may return
-///        reserve that reappears (emissions recycled over no-staker spans) to the Treasury.
+///        Renouncing sweeps whatever uncommitted reserve remains to the Treasury in the same
+///        transaction (so nobody can block it by adding 1 wei to the reserve); afterwards funding is
+///        refused and anyone may return reserve that reappears (emissions recycled over no-staker
+///        spans) to the Treasury.
 ///      - `guardian`: emergency control; may pause and unpause deposits. Withdrawals and claims can
 ///        never be paused.
 ///      The fee recipient `treasury` is immutable and has no power over this contract.
@@ -207,7 +209,6 @@ contract LockerFarm is ReentrancyGuard {
     error NothingReceived();
     error NotPendingEmissionsManager();
     error NotPendingGuardian();
-    error ReserveNotEmpty(uint256 rewardReserve);
     error EmissionsRenounced();
 
     // ----------------------------------------------------------------------------------------
@@ -434,14 +435,23 @@ contract LockerFarm is ReentrancyGuard {
         pendingEmissionsManager = address(0);
     }
 
-    /// @notice Permanently give up emission control. No function can set the role again. Refused
-    ///         while uncommitted reserve remains: return it to the Treasury or commit it first.
-    function renounceEmissionsManager() external onlyEmissionsManager {
+    /// @notice Permanently give up emission control. No function can set the role again. Whatever
+    ///         uncommitted reserve remains after accrual (including anything a third party added
+    ///         with `fundRewards` or `syncRewardReserve`, or emissions recycled over a no-staker span)
+    ///         is sent to the immutable Treasury in the same transaction, so the renounce can neither
+    ///         be blocked nor strand LOCKER. The running epoch, principal and accrued rewards are
+    ///         untouched.
+    function renounceEmissionsManager() external nonReentrant onlyEmissionsManager {
         _updateGlobalRewards();
-        if (rewardReserve > 0) revert ReserveNotEmpty(rewardReserve);
+        uint256 swept = rewardReserve;
+        rewardReserve = 0;
         emissionsManager = address(0);
         pendingEmissionsManager = address(0);
         emit EmissionsManagerRenounced(msg.sender);
+        if (swept > 0) {
+            emit UncommittedRewardsReturned(treasury, swept);
+            rewardToken.safeTransfer(treasury, swept);
+        }
     }
 
     /// @notice Offer the guardian role to `newGuardian`, who must accept it. `address(0)` cancels.

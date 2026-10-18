@@ -100,14 +100,116 @@ contract LockerFarmRolesTest is FarmTestBase {
         assertEq(imdFarm.emissionsManager(), OWNER);
     }
 
-    function test_renounceEmissionsManagerRequiresEmptyReserve() public {
+    function test_renounceSweepsUncommittedReserveToTreasury() public {
+        _deposit(imdFarm, ALICE, 100e18);
         _startEpoch(imdFarm, 1_000e18);
+        vm.warp(block.timestamp + 3 days);
         uint256 reserve = imdFarm.rewardReserve();
         assertGt(reserve, 0);
-        vm.expectRevert(abi.encodeWithSelector(LockerFarm.ReserveNotEmpty.selector, reserve));
+        uint256 rate = imdFarm.rewardRate();
+        uint256 finish = imdFarm.periodFinish();
+        uint256 treasuryBefore = locker.balanceOf(address(treasury));
+
+        vm.expectEmit(true, false, false, true);
+        emit LockerFarm.EmissionsManagerRenounced(OWNER);
+        vm.expectEmit(true, false, false, true);
+        emit LockerFarm.UncommittedRewardsReturned(address(treasury), reserve);
         vm.prank(OWNER);
         imdFarm.renounceEmissionsManager();
-        assertEq(imdFarm.emissionsManager(), OWNER, "still in control");
+
+        assertEq(imdFarm.emissionsManager(), address(0));
+        assertEq(imdFarm.rewardReserve(), 0, "reserve swept");
+        assertEq(locker.balanceOf(address(treasury)) - treasuryBefore, reserve, "swept to the Treasury only");
+        // The running epoch, principal and accrued rewards are untouched and still fully backed.
+        assertEq(imdFarm.rewardRate(), rate);
+        assertEq(imdFarm.periodFinish(), finish);
+        assertGt(imdFarm.earned(ALICE), 0);
+        assertGe(locker.balanceOf(address(imdFarm)), imdFarm.remainingEpochRewards() + imdFarm.earned(ALICE));
+        vm.warp(finish);
+        vm.prank(ALICE);
+        imdFarm.exit();
+        // Only per-share rounding dust (well under 1,000 wei here) may remain once the epoch has paid out.
+        assertLt(locker.balanceOf(address(imdFarm)), 1_000, "nothing stranded after the epoch pays out");
+    }
+
+    function test_renounceWithEmptyReserveTransfersNothing() public {
+        // The LOCKER farm was never funded: nothing to sweep.
+        assertEq(lockerFarm.rewardReserve(), 0);
+        uint256 treasuryBefore = locker.balanceOf(address(treasury));
+        vm.prank(OWNER);
+        lockerFarm.renounceEmissionsManager();
+        assertEq(lockerFarm.emissionsManager(), address(0));
+        assertEq(locker.balanceOf(address(treasury)), treasuryBefore);
+    }
+
+    /// @dev A third party cannot block the renounce by putting 1 wei into the reserve ahead of it
+    ///      with the permissionless `fundRewards`.
+    function test_strangerCannotBlockRenounceViaFundRewards() public {
+        uint256 reserve = imdFarm.rewardReserve();
+        vm.prank(OWNER);
+        imdFarm.returnUncommittedRewards(reserve);
+        assertEq(imdFarm.rewardReserve(), 0);
+
+        vm.prank(OWNER);
+        locker.transfer(MALLORY, 2);
+        vm.startPrank(MALLORY); // front-runs the renounce transaction
+        locker.approve(address(imdFarm), 1);
+        imdFarm.fundRewards(1);
+        vm.stopPrank();
+        assertEq(imdFarm.rewardReserve(), 1);
+
+        uint256 treasuryBefore = locker.balanceOf(address(treasury));
+        vm.prank(OWNER);
+        imdFarm.renounceEmissionsManager();
+        assertEq(imdFarm.emissionsManager(), address(0), "owner could not renounce");
+        assertEq(imdFarm.rewardReserve(), 0);
+        assertEq(locker.balanceOf(address(treasury)) - treasuryBefore, 1, "the wei goes to the Treasury");
+    }
+
+    /// @dev Same with a plain transfer followed by the permissionless `syncRewardReserve`.
+    function test_strangerCannotBlockRenounceViaDonationAndSync() public {
+        uint256 reserve = imdFarm.rewardReserve();
+        vm.prank(OWNER);
+        imdFarm.returnUncommittedRewards(reserve);
+        assertEq(imdFarm.rewardReserve(), 0);
+
+        vm.prank(OWNER);
+        locker.transfer(MALLORY, 2);
+        vm.startPrank(MALLORY);
+        locker.transfer(address(imdFarm), 1);
+        imdFarm.syncRewardReserve();
+        vm.stopPrank();
+        assertEq(imdFarm.rewardReserve(), 1);
+
+        vm.prank(OWNER);
+        imdFarm.renounceEmissionsManager();
+        assertEq(imdFarm.emissionsManager(), address(0), "owner could not renounce");
+        assertEq(imdFarm.rewardReserve(), 0);
+    }
+
+    /// @dev No attacker needed: while an epoch runs with nobody staked, every accrual recycles the
+    ///      emissions since the last update into the reserve, so a return-then-renounce in two
+    ///      transactions always finds a non-empty reserve. The renounce must still go through.
+    function test_renounceSucceedsWhileEpochRecyclesWithNoStakers() public {
+        uint256 committed = uint256(30 days) * 1e18; // 1e18 per second
+        _fund(imdFarm, committed);
+        _startEpoch(imdFarm, committed);
+        assertEq(imdFarm.rewardRate(), 1e18);
+        assertEq(imdFarm.totalStaked(), 0);
+        uint256 reserve = imdFarm.rewardReserve();
+        vm.prank(OWNER);
+        imdFarm.returnUncommittedRewards(reserve);
+        assertEq(imdFarm.rewardReserve(), 0);
+
+        vm.warp(block.timestamp + 1);
+        uint256 treasuryBefore = locker.balanceOf(address(treasury));
+        vm.prank(OWNER);
+        imdFarm.renounceEmissionsManager();
+        assertEq(imdFarm.emissionsManager(), address(0), "owner could not renounce");
+        assertEq(imdFarm.rewardReserve(), 0);
+        assertEq(locker.balanceOf(address(treasury)) - treasuryBefore, 1e18, "the recycled second was swept");
+        // The rest of the epoch is still backed for whoever stakes later.
+        assertGe(locker.balanceOf(address(imdFarm)), imdFarm.remainingEpochRewards());
     }
 
     function test_renouncedEmissionsManagerIsPermanent() public {

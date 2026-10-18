@@ -74,7 +74,7 @@ funding and schedules are isolated by construction.
 |------|-------|--------|----------|
 | Treasury owner | `LockerTreasury.owner()` | Withdraw Treasury balances, refill farms | **Not possible** (`renounceOwnership` reverts). Transfer is two-step. |
 | Farm creation | `LockerFarmFactory.owner()` | `createFarm`, `registerFarm` | `renounceOwnership()` — permanent. After it, no caller (including `address(0)`) passes `onlyOwner`. |
-| Emissions manager | `LockerFarm.emissionsManager` (per farm) | `startEpoch`, `boostEmissions`, `setRewardRate`, `returnUncommittedRewards`, offer role | `renounceEmissionsManager()` — permanent; refused while `rewardReserve > 0` (return or commit it first). Afterwards `fundRewards` is refused and `returnUncommittedRewards` becomes permissionless, so reserve that reappears (emissions recycled over a no-staker span) always has a path to the Treasury. |
+| Emissions manager | `LockerFarm.emissionsManager` (per farm) | `startEpoch`, `boostEmissions`, `setRewardRate`, `returnUncommittedRewards`, offer role | `renounceEmissionsManager()` — permanent. Whatever uncommitted reserve remains is sent to the Treasury in the same transaction (event `UncommittedRewardsReturned`), so a third party cannot block the renounce by adding 1 wei to the reserve, and nothing is stranded. The running epoch is untouched. Afterwards `fundRewards` is refused and `returnUncommittedRewards` becomes permissionless, so reserve that reappears (emissions recycled over a no-staker span) always has a path to the Treasury. |
 | Guardian (emergency) | `LockerFarm.guardian` (per farm) | `pauseDeposits` / `unpauseDeposits`, offer role | `renounceGuardian()` — permanent; deposits are unpaused on renounce so nothing is stuck. |
 
 Farm role transfers are **two-step**, like the Treasury's and factory's `Ownable2Step`: the holder
@@ -156,10 +156,13 @@ an owner-only call that emits an event.
 
 Later: `boostEmissions`, `setRewardRate`, further `startEpoch` calls and further `createFarm` calls
 as needed; `pauseDeposits` for emergencies; the `renounce*` functions when the project decides to
-decentralise, one role at a time, keeping the Treasury owner. Before `renounceEmissionsManager`,
-return the farm's uncommitted reserve to the Treasury with `returnUncommittedRewards(rewardReserve())`
-(or commit it with `startEpoch`); the renounce reverts otherwise. Role hand-overs to a multisig need
-the multisig to call `accept…` before the old key is retired.
+decentralise, one role at a time, keeping the Treasury owner. `renounceEmissionsManager` is a single
+transaction: commit with `startEpoch` first whatever the farm should still emit, because any
+uncommitted reserve left at that moment (including reserve a stranger adds or emissions recycled
+while nobody was staked) is swept to the Treasury by the renounce itself. No preparatory
+`returnUncommittedRewards` or `setRewardRate(0)` is needed, and no third party can make the renounce
+revert. Role hand-overs to a multisig need the multisig to call `accept…` before the old key is
+retired.
 
 ## Chosen constants
 
@@ -197,7 +200,11 @@ the multisig to call `accept…` before the old key is retired.
   brief's rules; the percentages and recipients are unchanged. A patient sybil that stakes a second
   wallet more than two days ahead is still indistinguishable from a genuine depositor on chain, and
   no contract rule can tell them apart; the delay removes the free, atomic versions of the trick and
-  makes the pre-positioned one pay the fee on its own exit.
+  makes the pre-positioned one pay the fee on its own exit. **For the requester to confirm:** with
+  the one-day period, a deposit made on day *N* earns nothing from withdrawals made on days *N* and
+  *N+1*, and while such stake is the only other stake in the farm the Treasury receives the full 10%
+  of those withdrawals. A different period, or a different reading of "eligible", is a one-constant
+  change (`FEE_ELIGIBILITY_PERIOD`) but an economic decision that is the requester's to make.
 * **Fee rounding** favours the protocol: the 10% rounds up to the wei, the 9% share rounds down and
   the Treasury receives the difference, so no withdrawal, however small, escapes the fee.
 
@@ -216,9 +223,11 @@ the multisig to call `accept…` before the old key is retired.
   rounding leaves a few wei of dust in the farm (never a shortfall, see the invariant tests), which
   `syncRewardReserve` can fold back into the reserve. Rewards emitted while nobody is staked return
   to the reserve.
-* Renouncing the emissions manager is final. The contract refuses it while uncommitted reserve
-  remains, refuses new funding afterwards, and lets anyone return later-recycled reserve to the
-  Treasury, so no LOCKER can be stranded by the renounce. Tokens sent to a farm by plain transfer are
+* Renouncing the emissions manager is final. The renounce sweeps the uncommitted reserve to the
+  immutable Treasury in the same transaction (a permissionless move the contract already allows after
+  the renounce, so the sweep gives no caller a new power), refuses new funding afterwards, and lets
+  anyone return later-recycled reserve to the Treasury, so no LOCKER can be stranded by the renounce
+  and nobody can block it. Tokens sent to a farm by plain transfer are
   recoverable through `syncRewardReserve` / `recoverExcessStakingToken` (to the reserve or the
   Treasury, never to a caller).
 * **Not audited.** Tests passing is not an audit. The contracts hold user funds and need the
@@ -234,8 +243,16 @@ forge fmt --check
 FOUNDRY_FUZZ_SEED=0x854336ea9d255bb73b298897b5ed19b6b1f127e0d9e91079beedf983f2109bd1 forge test
 ```
 
-Results on the authoring machine (forge 1.8.3, solc 0.8.26): 106 tests, 0 failures, with and
-without the seed; `forge fmt --check` clean. The suite covers:
+Results on the authoring machine (forge 1.8.3, solc 0.8.26) for the previously accepted revision:
+106 tests, 0 failures, with and without the seed; `forge fmt --check` clean. The latest revision
+(the renounce sweep and its five tests, replacing one test that asserted the old `ReserveNotEmpty`
+revert) could **not** be executed by the author: the authoring machine's shell sandbox refused to
+start any process in both rounds. The job's own check harness did build and run it: 110 tests, of
+which 107 passed and 3 failed on a fixture bug in the three new tests (`vm.prank(OWNER)` was
+consumed by an inline `rewardReserve()` view call, so `returnUncommittedRewards` ran as the test
+contract and reverted `NotEmissionsManager`). The reserve read is now hoisted above the prank, as
+the other role tests already do; the contract was unchanged by that repair. The independent
+verifier's run is the authoritative result. The suite covers:
 
 * `LaunchToken.t.sol` — name/symbol/decimals, whole supply to deployer, exact transfers, no mint or
   admin surface, fuzzed supply conservation.
@@ -252,9 +269,11 @@ without the seed; `forge fmt --check` clean. The suite covers:
   (including on the LOCKER farm), no-staker recycling, fuzzed "never over-promises".
 * `LockerFarmRoles.t.sol` — role separation, two-step transfers (offer, wrong acceptor, cancel,
   replace), permanent renouncement (old holder, former offeree, stranger and `address(0)` all
-  rejected), renounce refused with reserve left, funding refused and permissionless return to the
-  Treasury after renounce, pause semantics, Treasury powerlessness, token recovery and the
-  untracked-balance sync.
+  rejected), the renounce sweeping leftover reserve to the Treasury while leaving the running epoch
+  intact, a stranger's 1-wei `fundRewards` or donation-plus-`syncRewardReserve` front-run not
+  blocking the renounce, the renounce going through while a no-staker epoch recycles emissions,
+  funding refused and permissionless return to the Treasury after renounce, pause semantics,
+  Treasury powerlessness, token recovery and the untracked-balance sync.
 * `LockerFarmReentrancy.t.sol` — a callback token attempting re-entrant `withdraw`, `claimFees`,
   `exit` and `deposit` is blocked by the guard.
 * `LockerTreasury.t.sol` — refills, withdrawals, ETH handling, non-renounceable two-step ownership,

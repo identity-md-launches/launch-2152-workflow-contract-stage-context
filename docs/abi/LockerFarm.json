@@ -1381,17 +1381,6 @@
   },
   {
     "type": "error",
-    "name": "ReserveNotEmpty",
-    "inputs": [
-      {
-        "name": "rewardReserve",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ]
-  },
-  {
-    "type": "error",
     "name": "RewardRateTooLow",
     "inputs": []
   },
