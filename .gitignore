@@ -1,0 +1,24 @@
+# Foundry build output
+out/
+cache/
+broadcast/
+
+# Local scratch space (deleted before verification)
+test/scratch/
+
+# Machine dotfiles mounted into the workspace, never part of the project
+.bash_profile
+.bashrc
+.gitconfig
+.gitmodules
+.idea
+.mcp.json
+.profile
+.ripgreprc
+.vscode
+.zprofile
+.zshrc
+.claude/
+
+# Leftover of the vendored OpenZeppelin clone; the sources live in lib/openzeppelin
+lib/openzeppelin-contracts/
