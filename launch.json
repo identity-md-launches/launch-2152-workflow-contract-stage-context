@@ -1,0 +1,42 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Locker",
+    "symbol": "LOCKER",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "LockerTreasury",
+      "constructorArgs": [
+        "$owner",
+        "$token"
+      ]
+    },
+    {
+      "contract": "LockerFarmFactory",
+      "constructorArgs": [
+        "$owner",
+        "$token",
+        "$contract:LockerTreasury"
+      ]
+    },
+    {
+      "contract": "LockerFarm",
+      "constructorArgs": [
+        "$token",
+        "$token",
+        "$contract:LockerTreasury",
+        "$owner"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Locker (LOCKER) farming platform on Sepolia. LaunchToken is the fixed-supply LOCKER token with no constructor arguments. LockerTreasury(owner_, lockerToken_) is the owner-controlled vault that receives the 1% Treasury share of withdrawal fees and refills farm reward reserves; its ownership is two-step and cannot be renounced. LockerFarmFactory(owner_, rewardToken_, treasury_) is the registry the owner uses to create further isolated farms (IMD, sIMD) after launch; renouncing its ownership permanently ends farm creation. LockerFarm(stakingToken_, rewardToken_, treasury_, admin_) is the LOCKER staking farm deployed at launch: both staking and reward token are LOCKER, the fee recipient is LockerTreasury, and admin_ is the launch owner as initial emissions manager and guardian (each role individually and permanently renounceable). Every owner and admin argument is $owner; nothing is owned by the factory or by IMD. Constructors are nonpayable, make no external calls and store addresses only. No initialization calls. No contract here is allocated any LOCKER at launch; the requester funds the Treasury and the farms after launch. The IMD and sIMD farms are created by the owner through LockerFarmFactory.createFarm once the token addresses are known, and the LOCKER farm is listed with registerFarm. Pool pairing: the manifest assignment's 'This launch' section pins the pair as native ETH ('Pair: native ETH. pool.pairedCurrency is the zero address'), states that admission refuses any other paired currency, and fixes pool.fee at 12500, tickSpacing at 60 and initialPrice as written; pairedCurrency therefore follows that launch section rather than the brief's LOCKER/IMD wording. The deployer derives the opening price from the policy's opening market cap (20 ETH for the whole supply) and the token's address, so pool.initialPrice is not the opening price."
+}
