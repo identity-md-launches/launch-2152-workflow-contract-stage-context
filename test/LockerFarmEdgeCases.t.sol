@@ -195,6 +195,7 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         _giveImd(BOB, 1);
         _deposit(imdFarm, ALICE, 100 ether);
         _deposit(imdFarm, BOB, 1);
+        _matureStakes();
 
         _withdraw(imdFarm, ALICE, 50 ether);
         assertEq(imdFarm.pendingFees(ALICE), 0, "self fee");
@@ -216,6 +217,7 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         _giveImd(BOB, 1_000 ether);
         _deposit(imdFarm, ALICE, 1_000 ether);
         _deposit(imdFarm, BOB, 1_000 ether);
+        _matureStakes();
 
         for (uint256 i; i < 10; ++i) {
             _withdraw(imdFarm, ALICE, 50 ether);
@@ -232,6 +234,7 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         _giveImd(BOB, 100 ether);
         _deposit(imdFarm, ALICE, 100 ether);
         _deposit(imdFarm, BOB, 100 ether);
+        _matureStakes();
         _withdraw(imdFarm, BOB, 100 ether); // Alice earns 9
         _withdraw(imdFarm, ALICE, 100 ether); // nobody else: all to Treasury
 
@@ -239,6 +242,10 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         _deposit(imdFarm, BOB, 10 ether);
         assertEq(imdFarm.pendingFees(BOB), 0, "re-depositor inherited old fee growth");
         assertEq(imdFarm.pendingFees(ALICE), 9 ether, "Alice's fees survive full withdrawal");
+        // Once Bob's new stake matures it still holds nothing of the old fee growth.
+        _matureStakes();
+        assertEq(imdFarm.pendingFees(BOB), 0, "matured re-deposit inherited old fee growth");
+        assertEq(imdFarm.eligibleStakeOf(BOB), 10 ether);
     }
 
     function test_feeOnLargeWithdrawalIsExact() public {
@@ -247,6 +254,7 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         _giveLocker(BOB, 1 ether);
         _deposit(lockerFarm, ALICE, big);
         _deposit(lockerFarm, BOB, 1 ether);
+        _matureStakes();
         _withdraw(lockerFarm, ALICE, big);
         assertEq(locker.balanceOf(ALICE), big * 9 / 10);
         assertEq(locker.balanceOf(address(treasury)), big / 100);
@@ -283,6 +291,7 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         _deposit(imdFarm, ALICE, 100 ether);
         _deposit(lockerFarm, BOB, 100 ether);
         _deposit(lockerFarm, CAROL, 100 ether);
+        _matureStakes();
         _fund(lockerFarm, 30_000 ether);
         _startEpoch(lockerFarm, 30_000 ether);
 
@@ -308,10 +317,12 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         if (c > 0) _seed(CAROL, c);
         if (d > 0) _seed(DAVE, d);
         uint256 others = b + c + d;
+        _matureStakes();
 
         _withdraw(imdFarm, ALICE, w);
 
-        uint256 fee = w / 10;
+        // The 10% rounds up to the wei; the 9% share rounds down.
+        uint256 fee = (w + 9) / 10;
         uint256 redistributed = others > 0 ? w * 9 / 100 : 0;
         assertEq(imd.balanceOf(ALICE), w - fee, "payout");
         assertEq(imd.balanceOf(address(treasury)), fee - redistributed, "treasury share");
@@ -329,15 +340,15 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         assertGe(imd.balanceOf(address(imdFarm)), imdFarm.totalStaked() + sumPending);
     }
 
-    /// @dev Fee is floor(10%) of the amount; it is never more than 10% and at most 1 wei short.
-    function testFuzz_feeIsTenPercentWithinOneWei(uint256 w) public {
+    /// @dev Fee is ceil(10%) of the amount: never less than 10%, at most 1 wei over, never zero.
+    function testFuzz_feeIsTenPercentRoundedUp(uint256 w) public {
         w = bound(w, 1, 1e30);
         _giveImd(ALICE, w);
         _deposit(imdFarm, ALICE, w);
         _withdraw(imdFarm, ALICE, w);
         uint256 fee = imd.balanceOf(address(treasury));
-        assertLe(fee * 10, w);
-        assertGt((fee + 1) * 10, w);
+        assertGe(fee * 10, w, "fee below 10%");
+        assertLt((fee - 1) * 10, w, "fee more than 1 wei above 10%");
         assertEq(imd.balanceOf(ALICE) + fee, w);
     }
 
@@ -397,6 +408,18 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         _fund(imdFarm, 30_000 ether);
         vm.prank(OWNER);
         imdFarm.setEmissionsManager(CAROL);
+        // An offer alone moves nothing: the owner keeps the role until Carol accepts.
+        assertEq(imdFarm.emissionsManager(), OWNER);
+        vm.prank(BOB);
+        vm.expectRevert(LockerFarm.NotPendingEmissionsManager.selector);
+        imdFarm.acceptEmissionsManager();
+        vm.prank(CAROL);
+        imdFarm.acceptEmissionsManager();
+        assertEq(imdFarm.emissionsManager(), CAROL);
+        assertEq(imdFarm.pendingEmissionsManager(), address(0));
+        vm.prank(CAROL);
+        vm.expectRevert(LockerFarm.NotPendingEmissionsManager.selector);
+        imdFarm.acceptEmissionsManager();
 
         vm.startPrank(OWNER);
         vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
@@ -542,6 +565,155 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, CAROL));
         treasury.renounceOwnership();
         assertEq(treasury.owner(), OWNER);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Fee-eligibility delay edges
+    // ---------------------------------------------------------------------------------------
+
+    function test_eligibilityBoundaryIsExactToTheSecond() public {
+        _giveImd(ALICE, 1_000 ether);
+        _deposit(imdFarm, ALICE, 1_000 ether);
+        _matureStakes();
+
+        // Bob deposits in the last second of a bucket: eligible one day and one second later.
+        uint256 bucket = block.timestamp / 1 days;
+        vm.warp((bucket + 1) * 1 days - 1);
+        _giveImd(BOB, 100 ether);
+        _deposit(imdFarm, BOB, 100 ether);
+        uint256 maturity = (bucket + 2) * 1 days;
+        assertEq(imdFarm.feeEligibilityStart(), maturity);
+
+        vm.warp(maturity - 1);
+        assertEq(imdFarm.eligibleStakeOf(BOB), 0);
+        assertEq(imdFarm.pendingStakeOf(BOB), 100 ether);
+        _withdraw(imdFarm, ALICE, 100 ether);
+        assertEq(imdFarm.pendingFees(BOB), 0, "pending stake shared a fee one second early");
+        assertEq(imd.balanceOf(address(treasury)), 10 ether, "no eligible other: all 10% to Treasury");
+
+        vm.warp(maturity);
+        assertEq(imdFarm.eligibleStakeOf(BOB), 100 ether);
+        assertEq(imdFarm.pendingFees(BOB), 0, "maturing stake was credited the earlier fee");
+        _withdraw(imdFarm, ALICE, 100 ether);
+        assertEq(imdFarm.pendingFees(BOB), 9 ether, "matured stake missed the fee");
+        assertEq(imd.balanceOf(address(treasury)), 11 ether);
+    }
+
+    function test_topUpAfterMaturityKeepsEligibleStakeAndEarnsNothingRetroactively() public {
+        _giveImd(ALICE, 100 ether);
+        _giveImd(BOB, 150 ether);
+        _giveImd(CAROL, 100 ether);
+        _deposit(imdFarm, ALICE, 100 ether);
+        _deposit(imdFarm, BOB, 100 ether);
+        _deposit(imdFarm, CAROL, 100 ether);
+        _matureStakes();
+
+        _deposit(imdFarm, BOB, 50 ether);
+        assertEq(imdFarm.eligibleStakeOf(BOB), 100 ether, "top-up reset eligible stake");
+        assertEq(imdFarm.pendingStakeOf(BOB), 50 ether);
+        assertEq(imdFarm.eligibleTotalStaked(), 300 ether);
+
+        _withdraw(imdFarm, ALICE, 100 ether);
+        // 9 ether shared by Bob's eligible 100 and Carol's 100; Bob's pending 50 is excluded.
+        assertApproxEqAbs(imdFarm.pendingFees(BOB), 4.5 ether, 1);
+        assertApproxEqAbs(imdFarm.pendingFees(CAROL), 4.5 ether, 1);
+
+        _matureStakes();
+        assertEq(imdFarm.eligibleStakeOf(BOB), 150 ether);
+        assertApproxEqAbs(imdFarm.pendingFees(BOB), 4.5 ether, 1, "matured top-up credited a past fee");
+
+        vm.prank(BOB);
+        imdFarm.claimFees();
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(LockerFarm.InsufficientBalance.selector, 151 ether, 150 ether));
+        imdFarm.withdraw(151 ether);
+        assertEq(imdFarm.pendingFees(BOB), 0, "double claim");
+    }
+
+    function test_partiallyWithdrawnPendingTrancheMaturesOnlyItsRemainder() public {
+        _giveImd(ALICE, 100 ether);
+        _giveImd(BOB, 100 ether);
+        _deposit(imdFarm, ALICE, 100 ether);
+        _matureStakes();
+        _deposit(imdFarm, BOB, 100 ether);
+        _withdraw(imdFarm, BOB, 40 ether);
+        // Bob's pending withdrawal paid Alice, the only eligible other depositor.
+        assertEq(imdFarm.pendingFees(ALICE), 3.6 ether);
+        assertEq(imdFarm.pendingStakeOf(BOB), 60 ether);
+
+        _matureStakes();
+        assertEq(imdFarm.eligibleStakeOf(BOB), 60 ether);
+        assertEq(imdFarm.eligibleTotalStaked(), 160 ether);
+        assertEq(imdFarm.pendingFees(BOB), 0);
+        _withdraw(imdFarm, ALICE, 100 ether);
+        assertEq(imdFarm.pendingFees(BOB), 9 ether);
+        assertEq(imdFarm.pendingFees(ALICE), 3.6 ether, "withdrawer earned from own fee");
+    }
+
+    /// @dev Bob deposits and withdraws at random times over several days while Alice, an eligible
+    ///      depositor, keeps withdrawing small amounts. Bob's eligible stake must match a model where
+    ///      each deposit matures at the start of the bucket after next and withdrawals consume the
+    ///      newest pending stake first; Alice's fee must go to Bob exactly when Bob has eligible stake.
+    /// forge-config: default.fuzz.runs = 512
+    function testFuzz_eligibilityMatchesModel(uint256 seed) public {
+        _giveImd(ALICE, 1_000 ether);
+        _deposit(imdFarm, ALICE, 1_000 ether);
+        _matureStakes();
+        _giveImd(BOB, 1e30);
+
+        uint256[] memory amt = new uint256[](16);
+        uint256[] memory bkt = new uint256[](16);
+        uint256 n;
+        uint256 bal;
+        for (uint256 step; step < 16; ++step) {
+            uint256 r = uint256(keccak256(abi.encode(seed, step)));
+            vm.warp(block.timestamp + (r % 30 hours));
+            uint256 cur = block.timestamp / 1 days;
+            if (bal == 0 || (r >> 64) % 3 != 0) {
+                uint256 a = bound(r >> 128, 1, 1e24);
+                _deposit(imdFarm, BOB, a);
+                amt[n] = a;
+                bkt[n] = cur;
+                ++n;
+                bal += a;
+            } else {
+                uint256 a = bound(r >> 128, 1, bal);
+                _withdraw(imdFarm, BOB, a);
+                bal -= a;
+                uint256 left = a;
+                for (uint256 k = n; k > 0 && left > 0; --k) {
+                    if (cur >= bkt[k - 1] + 2 || amt[k - 1] == 0) continue;
+                    uint256 take = left < amt[k - 1] ? left : amt[k - 1];
+                    amt[k - 1] -= take;
+                    left -= take;
+                }
+            }
+            uint256 pendingModel;
+            for (uint256 k; k < n; ++k) {
+                if (cur < bkt[k] + 2) pendingModel += amt[k];
+            }
+            assertEq(imdFarm.balanceOf(BOB), bal, "balance");
+            assertEq(imdFarm.pendingStakeOf(BOB), pendingModel, "pending stake differs from model");
+            assertEq(imdFarm.eligibleTotalStaked(), imdFarm.eligibleStakeOf(BOB) + imdFarm.eligibleStakeOf(ALICE));
+
+            uint256 bobFees = imdFarm.pendingFees(BOB);
+            uint256 treasuryBefore = imd.balanceOf(address(treasury));
+            _withdraw(imdFarm, ALICE, 1 ether);
+            uint256 toTreasury = imd.balanceOf(address(treasury)) - treasuryBefore;
+            if (bal - pendingModel == 0) {
+                assertEq(toTreasury, 0.1 ether, "fee went to pending stake");
+                assertEq(imdFarm.pendingFees(BOB), bobFees, "pending stake earned a fee");
+            } else {
+                assertEq(toTreasury, 0.01 ether, "eligible other ignored");
+                assertApproxEqAbs(imdFarm.pendingFees(BOB) - bobFees, 0.09 ether, 1e7, "Bob's share");
+                assertLe(imdFarm.pendingFees(BOB) - bobFees, 0.09 ether);
+            }
+        }
+        // Everything owed is payable.
+        assertGe(
+            imd.balanceOf(address(imdFarm)),
+            imdFarm.totalStaked() + imdFarm.pendingFees(ALICE) + imdFarm.pendingFees(BOB)
+        );
     }
 
     function _seed(address who, uint256 amount) internal {

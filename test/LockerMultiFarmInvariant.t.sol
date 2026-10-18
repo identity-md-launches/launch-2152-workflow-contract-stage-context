@@ -37,6 +37,10 @@ contract MultiFarmHandler is Test {
     uint256 public isolationViolations;
     uint256 public accumulatorDecreases;
     uint256 public roleRestorations;
+    uint256 public feeRecipientViolations;
+    uint256 public treasuryShareViolations;
+    uint256 public withdrawalsWithEligibleOthers;
+    uint256 public withdrawalsWithoutEligibleOthers;
 
     constructor(
         LaunchToken locker_,
@@ -69,6 +73,11 @@ contract MultiFarmHandler is Test {
 
     function _token(uint256 i) internal view returns (address) {
         return i == 0 ? address(imd) : address(locker);
+    }
+
+    /// @dev What a withdrawal of `amount` pays out: the 10% fee rounds up to the wei.
+    function _net(uint256 amount) internal pure returns (uint256) {
+        return amount - (amount * 1_000 + 9_999) / 10_000;
     }
 
     function _bal(uint256 i, address who) internal view returns (uint256) {
@@ -134,15 +143,60 @@ contract MultiFarmHandler is Test {
         amount = bound(amount, 1, bal);
         uint256 pendingBefore = farm.pendingFees(who);
         uint256 before = _bal(i, who);
+        Split memory split = _snapshot(i, who);
         bytes32 other = _otherState(i);
         vm.prank(who);
         farm.withdraw(amount);
         uint256 got = _bal(i, who) - before;
         withdrawnNet[i] += got;
-        if (got != amount - amount * 1_000 / 10_000) ++payoutViolations;
+        if (got != _net(amount)) ++payoutViolations;
         // The withdrawer's claimable fees must not grow from their own withdrawal.
         if (farm.pendingFees(who) > pendingBefore) ++selfFeeViolations;
+        _checkSplit(i, who, amount, split);
         _after(i, other);
+    }
+
+    struct Split {
+        uint256 treasuryBefore;
+        uint256 othersEligible;
+        uint256[] elig;
+        uint256[] fees;
+    }
+
+    /// @dev Every other depositor's eligible stake and claimable fees before a withdrawal.
+    function _snapshot(uint256 i, address who) internal view returns (Split memory split) {
+        LockerFarm farm = farms[i];
+        uint256 n = actors.length;
+        split.treasuryBefore = _bal(i, address(treasury));
+        split.elig = new uint256[](n);
+        split.fees = new uint256[](n);
+        for (uint256 k; k < n; ++k) {
+            if (actors[k] == who) continue;
+            split.elig[k] = farm.eligibleStakeOf(actors[k]);
+            split.fees[k] = farm.pendingFees(actors[k]);
+            split.othersEligible += split.elig[k];
+        }
+    }
+
+    /// @dev 9% goes to the other eligible stake in proportion, or all 10% to the Treasury if none.
+    function _checkSplit(uint256 i, address who, uint256 amount, Split memory split) internal {
+        LockerFarm farm = farms[i];
+        uint256 fee = amount - _net(amount);
+        uint256 redistributed = split.othersEligible > 0 ? amount * 900 / 10_000 : 0;
+        if (_bal(i, address(treasury)) - split.treasuryBefore != fee - redistributed) ++treasuryShareViolations;
+        if (split.othersEligible > 0) ++withdrawalsWithEligibleOthers;
+        else ++withdrawalsWithoutEligibleOthers;
+        uint256 gained;
+        for (uint256 k; k < actors.length; ++k) {
+            if (actors[k] == who) continue;
+            uint256 inc = farm.pendingFees(actors[k]) - split.fees[k];
+            gained += inc;
+            if (split.elig[k] == 0 && inc != 0) ++feeRecipientViolations; // pending stake earned a fee
+            if (split.elig[k] > 0 && inc > redistributed * split.elig[k] / split.othersEligible + 1) {
+                ++feeRecipientViolations;
+            }
+        }
+        if (gained > redistributed) ++feeRecipientViolations;
     }
 
     function exit(uint256 farmSeed, uint256 actorSeed) external {
@@ -157,7 +211,7 @@ contract MultiFarmHandler is Test {
         bytes32 other = _otherState(i);
         vm.prank(who);
         farm.exit();
-        uint256 net = bal - bal * 1_000 / 10_000;
+        uint256 net = _net(bal);
         if (i == 0) {
             withdrawnNet[0] += net;
             feesClaimed[0] += imd.balanceOf(who) - stakeBefore - net;
@@ -301,8 +355,9 @@ contract MultiFarmHandler is Test {
         _after(i, _otherState(i));
     }
 
+    /// @dev Mostly short hops, so stake is often caught inside its fee-eligibility delay.
     function warp(uint256 secs) external {
-        vm.warp(block.timestamp + bound(secs, 1, 12 days));
+        vm.warp(block.timestamp + (secs % 4 == 0 ? bound(secs, 1, 12 days) : bound(secs, 1, 30 hours)));
         _after(0, _otherState(0));
     }
 }
@@ -423,6 +478,26 @@ contract LockerMultiFarmInvariantTest is Test {
         assertEq(handler.isolationViolations(), 0, "an action on one farm changed the other");
         assertEq(handler.accumulatorDecreases(), 0, "an accumulator went backwards");
         assertEq(handler.roleRestorations(), 0, "a renounced guardian role was used or restored");
+        assertEq(handler.feeRecipientViolations(), 0, "a fee reached pending stake or exceeded a pro-rata share");
+        assertEq(handler.treasuryShareViolations(), 0, "Treasury received the wrong share of a fee");
+    }
+
+    /// @dev Per-account eligibility adds up to the global figures the fee split uses.
+    /// forge-config: default.invariant.runs = 128
+    /// forge-config: default.invariant.depth = 64
+    function invariant_eligibilityAccounting() public view {
+        for (uint256 i; i < 2; ++i) {
+            LockerFarm farm = _farm(i);
+            uint256 eligible;
+            for (uint256 a; a < handler.actorCount(); ++a) {
+                address who = handler.actors(a);
+                uint256 pending = farm.pendingStakeOf(who);
+                assertLe(pending, farm.balanceOf(who), "pending stake above balance");
+                eligible += farm.eligibleStakeOf(who);
+            }
+            assertEq(eligible, farm.eligibleTotalStaked(), "eligible stake drift");
+            assertLe(farm.eligibleTotalStaked(), farm.totalStaked());
+        }
     }
 
     /// @dev Roles nobody renounced stay with the owner; the factory registry is untouched by farm use.
