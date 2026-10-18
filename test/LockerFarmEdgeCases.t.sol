@@ -716,6 +716,129 @@ contract LockerFarmEdgeCasesTest is FarmTestBase {
         );
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Emissions renounce: exact sweep, nothing owed touched, nothing stranded
+    // ---------------------------------------------------------------------------------------
+
+    /// @dev Uncommitted reserve the farm would hold after accruing now: emissions over a span with
+    ///      nobody staked return to the reserve on the next update.
+    function _reserveAfterAccrual(LockerFarm farm) internal view returns (uint256) {
+        uint256 recycled =
+            farm.totalStaked() == 0 ? (farm.lastTimeRewardApplicable() - farm.lastUpdateTime()) * farm.rewardRate() : 0;
+        return farm.rewardReserve() + recycled;
+    }
+
+    /// @dev The renounce happens at an arbitrary point: before, during or after the epoch, with a
+    ///      staker present, gone, or never there. It must move exactly the post-accrual reserve to the
+    ///      Treasury and leave rewards owed and the rest of the epoch in place; afterwards every LOCKER
+    ///      the farm holds must reach the staker or (permissionlessly) the Treasury, bar rounding dust.
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_renounceSweepsExactlyAndStrandsNothing(
+        uint256 funded,
+        uint256 committed,
+        uint256 stake,
+        uint256 tStake,
+        uint256 tUnstake,
+        uint256 tRenounce
+    ) public {
+        funded = bound(funded, EPOCH, 50_000_000 ether);
+        committed = bound(committed, EPOCH, funded);
+        stake = bound(stake, 0, 1_000_000 ether);
+        _fund(imdFarm, funded);
+        _startEpoch(imdFarm, committed);
+        uint256 finish = imdFarm.periodFinish();
+
+        if (stake > 0) {
+            vm.warp(block.timestamp + bound(tStake, 0, 35 days));
+            _giveImd(ALICE, stake);
+            _deposit(imdFarm, ALICE, stake);
+            // A third of the runs leave the farm empty again before the renounce.
+            if (tUnstake % 3 == 0) {
+                vm.warp(block.timestamp + bound(tUnstake, 0, 10 days));
+                vm.prank(ALICE);
+                imdFarm.exit();
+            }
+        }
+        vm.warp(block.timestamp + bound(tRenounce, 0, 40 days));
+
+        uint256 expected = _reserveAfterAccrual(imdFarm);
+        uint256 earnedBefore = imdFarm.earned(ALICE);
+        uint256 remaining = imdFarm.remainingEpochRewards();
+        uint256 rate = imdFarm.rewardRate();
+        uint256 treasuryBefore = locker.balanceOf(address(treasury));
+
+        vm.prank(OWNER);
+        imdFarm.renounceEmissionsManager();
+
+        assertEq(locker.balanceOf(address(treasury)) - treasuryBefore, expected, "sweep != reserve after accrual");
+        assertEq(imdFarm.rewardReserve(), 0, "reserve left behind");
+        assertEq(imdFarm.earned(ALICE), earnedBefore, "accrued rewards touched");
+        assertEq(imdFarm.remainingEpochRewards(), remaining, "running epoch touched");
+        assertEq(imdFarm.rewardRate(), rate);
+        assertEq(imdFarm.periodFinish(), finish);
+        assertEq(imdFarm.emissionsManager(), address(0));
+        assertGe(locker.balanceOf(address(imdFarm)), remaining + earnedBefore, "epoch no longer backed");
+
+        // Run the epoch out. The staker leaves with everything earned; a stranger returns whatever
+        // was recycled after the renounce.
+        vm.warp(finish + 1);
+        uint256 lockerBefore = locker.balanceOf(ALICE);
+        uint256 owed = imdFarm.earned(ALICE);
+        vm.prank(ALICE);
+        imdFarm.exit();
+        assertEq(locker.balanceOf(ALICE) - lockerBefore, owed);
+        uint256 recycled = _reserveAfterAccrual(imdFarm);
+        if (recycled > 0) {
+            vm.prank(BOB);
+            imdFarm.returnUncommittedRewards(recycled);
+        }
+        assertEq(imdFarm.rewardReserve(), 0);
+        // Per-share rounding is the only thing that may stay behind: under a wei per update per
+        // 1e18 staked, plus a wei per checkpoint.
+        assertLe(locker.balanceOf(address(imdFarm)), 8 * (stake / 1e18 + 1), "LOCKER stranded after renounce");
+    }
+
+    /// @dev A pending offer cannot be accepted once the holder renounces, even in the same block.
+    function test_pendingOffereeCannotAcceptAfterRenounce() public {
+        _fund(imdFarm, 30_000 ether);
+        vm.startPrank(OWNER);
+        imdFarm.setEmissionsManager(CAROL);
+        imdFarm.renounceEmissionsManager();
+        vm.stopPrank();
+        assertEq(locker.balanceOf(address(treasury)), 30_000 ether, "unused funding swept to the Treasury");
+        vm.prank(CAROL);
+        vm.expectRevert(LockerFarm.NotPendingEmissionsManager.selector);
+        imdFarm.acceptEmissionsManager();
+        // Renouncing twice is impossible: the role no longer exists.
+        vm.prank(OWNER);
+        vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
+        imdFarm.renounceEmissionsManager();
+        vm.prank(address(0));
+        vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
+        imdFarm.renounceEmissionsManager();
+    }
+
+    /// @dev Only the emissions manager may renounce; the guardian, the Treasury, a stranger and the
+    ///      factory cannot trigger the sweep.
+    function test_onlyEmissionsManagerCanRenounce() public {
+        _fund(imdFarm, 1 ether);
+        address[4] memory callers = [BOB, address(treasury), address(factory), address(0)];
+        for (uint256 i; i < 4; ++i) {
+            vm.prank(callers[i]);
+            vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
+            imdFarm.renounceEmissionsManager();
+        }
+        vm.prank(OWNER);
+        imdFarm.setGuardian(BOB);
+        vm.prank(BOB);
+        imdFarm.acceptGuardian();
+        vm.prank(BOB);
+        vm.expectRevert(LockerFarm.NotEmissionsManager.selector);
+        imdFarm.renounceEmissionsManager();
+        assertEq(imdFarm.emissionsManager(), OWNER);
+        assertEq(imdFarm.rewardReserve(), 1 ether);
+    }
+
     function _seed(address who, uint256 amount) internal {
         _giveImd(who, amount);
         _deposit(imdFarm, who, amount);

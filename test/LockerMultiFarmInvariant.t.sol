@@ -31,6 +31,8 @@ contract MultiFarmHandler is Test {
     uint256[2] public lastFeePerShare;
     uint256[2] public lastRewardPerToken;
     bool[2] public guardianRenounced;
+    bool[2] public emissionsRenounced;
+    uint256[2] public swept;
 
     uint256 public selfFeeViolations;
     uint256 public payoutViolations;
@@ -41,6 +43,8 @@ contract MultiFarmHandler is Test {
     uint256 public treasuryShareViolations;
     uint256 public withdrawalsWithEligibleOthers;
     uint256 public withdrawalsWithoutEligibleOthers;
+    uint256 public renounceViolations;
+    uint256 public emissionsRenounces;
 
     constructor(
         LaunchToken locker_,
@@ -110,6 +114,10 @@ contract MultiFarmHandler is Test {
             if (guardianRenounced[k] && (farms[k].guardian() != address(0) || farms[k].depositsPaused())) {
                 ++roleRestorations;
             }
+            if (
+                emissionsRenounced[k]
+                    && (farms[k].emissionsManager() != address(0) || farms[k].pendingEmissionsManager() != address(0))
+            ) ++roleRestorations;
         }
     }
 
@@ -259,6 +267,21 @@ contract MultiFarmHandler is Test {
     function treasuryFund(uint256 farmSeed, uint256 amount) external {
         uint256 i = farmSeed % 2;
         amount = bound(amount, 1, 2_000_000e18);
+        if (emissionsRenounced[i]) {
+            // Funding a farm whose emissions are renounced would strand LOCKER: it must be refused,
+            // whoever sends it. A stranger tries directly; the tokens stay with them on refusal.
+            address who = _actor(amount);
+            vm.prank(owner);
+            locker.transfer(who, amount);
+            vm.startPrank(who);
+            locker.approve(address(farms[i]), amount);
+            try farms[i].fundRewards(amount) {
+                ++renounceViolations;
+            } catch {}
+            locker.approve(address(farms[i]), 0);
+            vm.stopPrank();
+            return;
+        }
         vm.startPrank(owner);
         locker.transfer(address(treasury), amount);
         bytes32 other = _otherState(i);
@@ -272,6 +295,7 @@ contract MultiFarmHandler is Test {
 
     function startEpoch(uint256 farmSeed, uint256 amount) external {
         uint256 i = farmSeed % 2;
+        if (emissionsRenounced[i]) return _tryManage(i, amount);
         uint256 reserve = farms[i].rewardReserve();
         if (reserve < 30 days) return;
         amount = bound(amount, 30 days, reserve);
@@ -283,6 +307,7 @@ contract MultiFarmHandler is Test {
 
     function boost(uint256 farmSeed, uint256 amount) external {
         uint256 i = farmSeed % 2;
+        if (emissionsRenounced[i]) return _tryManage(i, amount);
         if (block.timestamp >= farms[i].periodFinish()) return;
         uint256 reserve = farms[i].rewardReserve();
         if (reserve == 0) return;
@@ -295,6 +320,7 @@ contract MultiFarmHandler is Test {
 
     function setRate(uint256 farmSeed, uint256 rate) external {
         uint256 i = farmSeed % 2;
+        if (emissionsRenounced[i]) return _tryManage(i, rate);
         LockerFarm farm = farms[i];
         if (block.timestamp >= farm.periodFinish()) return;
         uint256 remaining = farm.periodFinish() - block.timestamp;
@@ -312,9 +338,91 @@ contract MultiFarmHandler is Test {
         if (reserve == 0) return;
         amount = bound(amount, 1, reserve);
         bytes32 other = _otherState(i);
-        vm.prank(owner);
+        // Once emissions are renounced the return is permissionless; any actor may push it.
+        vm.prank(emissionsRenounced[i] ? _actor(amount) : owner);
         farms[i].returnUncommittedRewards(amount);
         returned[i] += amount;
+        _after(i, other);
+    }
+
+    /// @dev After the emissions manager renounced, the former holder must not be able to run any
+    ///      emissions function.
+    function _tryManage(uint256 i, uint256 amount) internal {
+        LockerFarm farm = farms[i];
+        uint256 reserve = farm.rewardReserve();
+        vm.startPrank(owner);
+        try farm.startEpoch(reserve) {
+            ++roleRestorations;
+        } catch {}
+        try farm.boostEmissions(bound(amount, 1, reserve + 1)) {
+            ++roleRestorations;
+        } catch {}
+        try farm.setRewardRate(0) {
+            ++roleRestorations;
+        } catch {}
+        vm.stopPrank();
+        _after(i, _otherState(i));
+    }
+
+    struct RenounceSnap {
+        uint256 reserve;
+        uint256 treasuryLocker;
+        uint256 rate;
+        uint256 finish;
+        uint256 remaining;
+        uint256 totalStaked;
+        uint256[] earned;
+        uint256[] fees;
+    }
+
+    /// @dev Occasionally renounces a farm's emissions manager at an arbitrary point (running epoch,
+    ///      no stakers, leftover reserve, ...). The renounce must sweep exactly the uncommitted
+    ///      reserve (including emissions recycled over a no-staker span) to the Treasury and leave
+    ///      the running epoch, principal, fees and accrued rewards untouched.
+    function renounceEmissions(uint256 farmSeed, uint256 dice) external {
+        uint256 i = farmSeed % 2;
+        if (emissionsRenounced[i] || dice % 4 != 0) return;
+        LockerFarm farm = farms[i];
+        RenounceSnap memory s;
+        s.reserve = farm.rewardReserve();
+        s.treasuryLocker = locker.balanceOf(address(treasury));
+        s.rate = farm.rewardRate();
+        s.finish = farm.periodFinish();
+        s.remaining = farm.remainingEpochRewards();
+        s.totalStaked = farm.totalStaked();
+        uint256 n = actors.length;
+        s.earned = new uint256[](n);
+        s.fees = new uint256[](n);
+        for (uint256 k; k < n; ++k) {
+            s.earned[k] = farm.earned(actors[k]);
+            s.fees[k] = farm.pendingFees(actors[k]);
+        }
+        // Emissions since the last update that nobody was staked for return to the reserve first.
+        uint256 recycled = s.totalStaked == 0 ? (farm.lastTimeRewardApplicable() - farm.lastUpdateTime()) * s.rate : 0;
+        bytes32 other = _otherState(i);
+
+        vm.prank(owner);
+        farm.renounceEmissionsManager();
+        emissionsRenounced[i] = true;
+        ++emissionsRenounces;
+
+        uint256 got = locker.balanceOf(address(treasury)) - s.treasuryLocker;
+        swept[i] += got;
+        returned[i] += got;
+        if (got != s.reserve + recycled) ++renounceViolations;
+        if (farm.rewardReserve() != 0) ++renounceViolations;
+        if (farm.rewardRate() != s.rate || farm.periodFinish() != s.finish) ++renounceViolations;
+        if (farm.remainingEpochRewards() != s.remaining || farm.totalStaked() != s.totalStaked) {
+            ++renounceViolations;
+        }
+        for (uint256 k; k < n; ++k) {
+            if (farm.earned(actors[k]) != s.earned[k] || farm.pendingFees(actors[k]) != s.fees[k]) {
+                ++renounceViolations;
+            }
+        }
+        if (farm.emissionsManager() != address(0) || farm.pendingEmissionsManager() != address(0)) {
+            ++renounceViolations;
+        }
         _after(i, other);
     }
 
@@ -341,6 +449,16 @@ contract MultiFarmHandler is Test {
     function tryRestoreGuardian(uint256 farmSeed, uint256 callerSeed) external {
         uint256 i = farmSeed % 2;
         address caller = callerSeed % 3 == 0 ? owner : callerSeed % 3 == 1 ? address(0) : _actor(callerSeed);
+        if (emissionsRenounced[i]) {
+            vm.prank(caller);
+            try farms[i].setEmissionsManager(caller) {
+                ++roleRestorations;
+            } catch {}
+            vm.prank(caller);
+            try farms[i].acceptEmissionsManager() {
+                ++roleRestorations;
+            } catch {}
+        }
         vm.prank(caller);
         try farms[i].setGuardian(caller) {
             if (guardianRenounced[i]) ++roleRestorations;
@@ -480,6 +598,7 @@ contract LockerMultiFarmInvariantTest is Test {
         assertEq(handler.roleRestorations(), 0, "a renounced guardian role was used or restored");
         assertEq(handler.feeRecipientViolations(), 0, "a fee reached pending stake or exceeded a pro-rata share");
         assertEq(handler.treasuryShareViolations(), 0, "Treasury received the wrong share of a fee");
+        assertEq(handler.renounceViolations(), 0, "emissions renounce swept the wrong amount or touched owed value");
     }
 
     /// @dev Per-account eligibility adds up to the global figures the fee split uses.
@@ -500,12 +619,14 @@ contract LockerMultiFarmInvariantTest is Test {
         }
     }
 
-    /// @dev Roles nobody renounced stay with the owner; the factory registry is untouched by farm use.
+    /// @dev Roles nobody renounced stay with the owner, renounced ones stay empty; the factory
+    ///      registry is untouched by farm use.
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 64
     function invariant_rolesAndRegistry() public view {
-        assertEq(imdFarm.emissionsManager(), OWNER);
-        assertEq(lockerFarm.emissionsManager(), OWNER);
+        for (uint256 i; i < 2; ++i) {
+            assertEq(_farm(i).emissionsManager(), handler.emissionsRenounced(i) ? address(0) : OWNER);
+        }
         assertEq(treasury.owner(), OWNER);
         assertEq(factory.owner(), OWNER);
         assertEq(factory.farmCount(), 1);
